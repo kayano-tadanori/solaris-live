@@ -1,0 +1,97 @@
+# 公開版 SOLARIS のライブデータ（ISS の軌道・雲）を毎時つくって GitHub Pages に出す（2026-10-07・まだ本番に入れていない）。
+# リポジトリ：kayano-tadanori/solaris-live（予定）。Pages の配信元＝「GitHub Actions」。データは Git にコミットしない（配信物だけ毎回入れかえ）。
+# 前回の正常なデータは Actions のキャッシュ（state/）に持つ。無ければ公開中のサイトから取り直す。
+# ・ISS：6 時間ごと（前回の取得から 6 時間たった回だけ CelesTrak へ）
+# ・雲：毎時（2026-10-07 オトン判断で公開。止めたいときはリポジトリの変数 CLOUDS_PUBLIC を "off"）
+# ・取れない回：前回のデータのまま配信し、ジョブは失敗にする（ログに理由）
+# ・同時に動かさない（concurrency）。配信物はそろってから一度に入れかわる（Pages の deploy は原子的）
+# secret は使わない（CelesTrak・NOAA の公開データを取るだけ。Tailscale やこの PC にはつながない）
+name: live-data
+on:
+  schedule:
+    - cron: "50 * * * *"   # 毎時 50 分（GMGSI は正時の約 40 分後に出る）
+  workflow_dispatch:
+    inputs:
+      force_iss:
+        description: "ISS を今すぐ取る"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: solaris-live-pages
+  cancel-in-progress: false
+env:
+  SITE_URL: https://kayano-tadanori.github.io/solaris-live
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      code: ${{ steps.make.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 前回のデータ（キャッシュ）
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: live-state-${{ github.run_id }}
+          restore-keys: live-state-
+      - name: ライブデータを作る
+        id: make
+        run: |
+          set +e
+          python live_update.py --state state --site _site --prev "$SITE_URL" \
+            --clouds "${{ vars.CLOUDS_PUBLIC || 'on' }}" --keep-hours "${{ vars.CLOUDS_KEEP_HOURS || '24' }}" --max-new 3 \
+            --iss-every-hours "${{ vars.ISS_EVERY_HOURS || '6' }}" ${{ inputs.force_iss && '--force-iss' || '' }}
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ $code -eq 1 ]; then exit 1; fi   # 配信物を作れない＝配信しない（前回の配信のまま）
+          exit 0
+      - name: 前回のデータを残す（キャッシュ）
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: live-state-${{ github.run_id }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+  keepalive:
+    # 公開リポジトリは 60 日間動きが無いと定期実行が止まる（GitHub の決まり）→ 毎月 1 日に workflow を「有効」にし直す（コミットはしない）
+    if: github.event_name == 'schedule' && github.event.schedule == '50 * * * *'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 毎月 1 日 0 時台だけ
+        run: |
+          if [ "$(date -u +%d%H)" = "0100" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/live-data.yml/enable" && echo "有効にし直した"
+          else echo "今回はしない"; fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+  result:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取れなかったデータがあれば失敗にする（配信は前回のデータで済んでいる）
+        if: needs.build.outputs.code == '2'
+        run: |
+          echo "::error::ISS または雲が取れなかった・確かめに通らなかった（前回のデータのまま配信）。build のログを見る"
+          exit 1
