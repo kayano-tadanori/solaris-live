@@ -29,12 +29,32 @@ def iso(d: datetime) -> str:
     return d.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+RETRY_WAITS = (20, 60)  # 時間切れ・接続できない・5xx のときだけ、待ってから 2 回までやり直す（2026-10-11：CelesTrak の時間切れで 1 回失敗）
+
+
 def get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        if r.status != 200:
-            raise RuntimeError(f"{url}: HTTP {r.status}")
-        return r.read()
+    """取る。時間切れ・つながらない・サーバーの一時的な失敗（5xx）だけやり直す。403・404 などはやり直さない（CelesTrak は短時間の連続取得を嫌う）"""
+    import random
+    import time
+    import urllib.error
+    last: Exception | None = None
+    for i, wait in enumerate((0, *RETRY_WAITS)):
+        if wait:
+            time.sleep(wait + random.uniform(0, 5))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"{url}: HTTP {r.status}")
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            last = e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+        print(f"取得をやり直す（{i + 1} 回目の失敗：{last}）", flush=True)
+    raise last if last else RuntimeError(url)
 
 
 def tle_checksum_ok(line: str) -> bool:
