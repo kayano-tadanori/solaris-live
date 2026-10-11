@@ -24,6 +24,8 @@ import tempfile
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+ISS_STOP_DAYS = 7  # update_iss_public.STOP_DAYS と同じ（アプリの stopAfterUtc）
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -109,7 +111,12 @@ def update_iss(a, state: Path, site: Path, prev_man: dict | None, now: datetime)
             out = site / "live" / "iss" / "iss.json"
             atomic_write(out, dumps(prev).encode("utf-8"))
             age_d = (now - parse_iso(prev["epochUtc"])).total_seconds() / 86400
-            info.update({"status": "stale" if failed else ("old" if age_d > 3 else "ok"), "file": "iss/iss.json", "sourceTimestamp": prev["epochUtc"],
+            # 7 日（STOP_DAYS）を超えた軌道は「期限切れ」：アプリは使わない（stopAfterUtc）。配信は続けるが失敗として知らせる＝無期限に正常扱いしない
+            expired = age_d > ISS_STOP_DAYS
+            if expired:
+                failed = True
+                info["error"] = info["error"] or f"軌道の元期が {ISS_STOP_DAYS} 日より古い（{prev['epochUtc']}）"
+            info.update({"status": "expired" if expired else "stale" if failed else ("old" if age_d > 3 else "ok"), "file": "iss/iss.json", "sourceTimestamp": prev["epochUtc"],
                          "generated": prev.get("generatedUtc") or prev["fetchedUtc"], "fetched": prev["fetchedUtc"],
                          "sha256": sha256(out), "size": out.stat().st_size})
     info["failed"] = failed
